@@ -44,6 +44,6 @@ async def webhook(request: Request):
     )
     
     reply = response.content[0].text
-    send_telegram_message(chat_id, f"You said: {user_text}")
+    send_telegram_message(chat_id, reply)
     
     return {"ok": True}
