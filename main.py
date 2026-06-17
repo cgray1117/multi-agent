@@ -37,6 +37,7 @@ def create_tables():
                 task TEXT NOT NULL,
                 status TEXT DEFAULT 'open',
                 due_date DATE,               -- NEW: optional due date, can be NULL
+                priority TEXT DEFAULT 'normal'
                 created_at TIMESTAMP DEFAULT NOW()
             )
         """))
@@ -256,6 +257,21 @@ def get_open_tasks(chat_id):
         """), {"chat_id": chat_id})
         return result.fetchall()
     
+def update_priority(chat_id, task_text, priority):
+    """
+    Updates the priority of a task matching the given text.
+    priority should be 'low', 'normal', or 'high'.
+    """
+    with engine.connect() as conn:
+        result = conn.execute(text("""
+            UPDATE tasks
+            SET priority = :priority
+            WHERE chat_id = :chat_id 
+              AND status = 'open'
+              AND task ILIKE :task_pattern
+        """), {"chat_id": chat_id, "priority": priority, "task_pattern": f"%{task_text}%"})
+        conn.commit()
+        return result.rowcount > 0
 # --- DATABASE SETUP ---
 
 # Pull the database connection string from environment variables
