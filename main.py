@@ -46,50 +46,12 @@ def create_tables():
 
 def send_daily_briefing():
     """
-    Pulls all open tasks for the user, sends them to Claude to be
-    ranked by urgency and estimated energy cost, then sends the
-    top priorities back as a morning briefing via Telegram.
+    Scheduled job — sends the morning briefing using the shared
+    priority summary logic.
     """
     chat_id = os.getenv("MY_CHAT_ID")
-    tasks = get_open_tasks(chat_id)
-
-    # If there's nothing to rank, just say so and stop early
-    if not tasks:
-        send_telegram_message(chat_id, "🌅 Good morning! You have no open tasks today.")
-        return
-
-    # Build a plain-text list of tasks (with due dates if present)
-    # to hand to Claude as context
-    task_lines = []
-    for t in tasks:
-        _, task_text, due_date = t
-        due_str = f" (due {due_date})" if due_date else ""
-        task_lines.append(f"- {task_text}{due_str}")
-    task_list_text = "\n".join(task_lines)
-
-    # Ask Claude to rank them. We're explicit about the output format
-    # so we can reliably parse it back out afterward.
-    prompt = f"""Here are my open tasks:
-
-                {task_list_text}
-
-                Rank these by urgency (factoring in due dates if present) and 
-                estimated energy cost (how much focus/effort each likely takes).
-                Return the top 3 I should focus on today, with a one-sentence 
-                reason for each. Keep it concise — this is a morning briefing,
-                not a report."""
-
-    response = claude_client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=500,
-        system="You are a personal executive assistant helping prioritize a busy day. Be direct and practical.",
-        messages=[{"role": "user", "content": prompt}]
-    )
-
-    briefing_text = response.content[0].text
-
-    # Send the AI-generated briefing back to Telegram
-    send_telegram_message(chat_id, f"🌅 Good morning! Here's your focus for today:\n\n{briefing_text}")
+    summary = generate_priority_summary(chat_id)
+    send_telegram_message(chat_id, f"🌅 Good morning! Here's your focus for today:\n\n{summary}")
 
 def complete_task(chat_id, task_text):
     """
@@ -272,6 +234,42 @@ def update_priority(chat_id, task_text, priority):
         """), {"chat_id": chat_id, "priority": priority, "task_pattern": f"%{task_text}%"})
         conn.commit()
         return result.rowcount > 0
+
+def generate_priority_summary(chat_id):
+    """
+    Pulls open tasks and asks Claude to rank them by urgency and
+    energy cost. Returns the summary text. Used by both the
+    scheduled morning briefing and the on-demand 'focus' command.
+    """
+    tasks = get_open_tasks(chat_id)
+
+    if not tasks:
+        return "You have no open tasks right now. 🎉"
+
+    task_lines = []
+    for t in tasks:
+        task_id, task_text, due_date = t
+        due_str = f" (due {due_date})" if due_date else ""
+        task_lines.append(f"- {task_text}{due_str}")
+    task_list_text = "\n".join(task_lines)
+
+    prompt = f"""Here are my open tasks:
+
+                {task_list_text}
+
+                Rank these by urgency (factoring in due dates if present) and 
+                estimated energy cost (how much focus/effort each likely takes).
+                Return the top 3 I should focus on right now, with a one-sentence 
+                reason for each. Keep it concise."""
+
+    response = claude_client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=500,
+        system="You are a personal executive assistant helping prioritize. Be direct and practical.",
+        messages=[{"role": "user", "content": prompt}]
+    )
+
+    return response.content[0].text
 # --- DATABASE SETUP ---
 
 # Pull the database connection string from environment variables
@@ -389,14 +387,23 @@ tools = [
         }
     },
     {
-    "name": "list_tasks",
-    "description": "Retrieves the user's current open tasks. Use this whenever the user asks what they need to do, what's on their list, or anything similar.",
-    "input_schema": {
-        "type": "object",
-        "properties": {},
-        "required": []
+        "name": "list_tasks",
+        "description": "Retrieves the user's current open tasks. Use this whenever the user asks what they need to do, what's on their list, or anything similar.",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        }
+    },
+    {
+        "name": "get_focus_priorities",
+        "description": "Analyzes the user's open tasks and returns the top priorities to focus on right now, ranked by urgency and effort. Use this when the user asks what to focus on, what's most important, or what they should work on.",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        }
     }
-}
 ]
 
 # Create the Anthropic client using our API key — this object is what
@@ -476,10 +483,14 @@ async def webhook(request: Request):
                     # so Claude has real data to phrase a natural response from
                     task_lines = []
                     for t in tasks:
-                        task_id, task_text, due_date = t
+                        _, task_text, due_date = t
                         due_str = f" (due {due_date})" if due_date else ""
                         task_lines.append(f"{task_text}{due_str}")
                     result_text = "; ".join(task_lines)
+            
+            elif tool_name == "get_focus_priorities":
+                result_text = generate_priority_summary(chat_id)
+
             else:
                 result_text = "Unknown tool"
 
