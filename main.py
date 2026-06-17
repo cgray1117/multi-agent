@@ -387,7 +387,16 @@ tools = [
             },
             "required": ["task", "priority"]
         }
+    },
+    {
+    "name": "list_tasks",
+    "description": "Retrieves the user's current open tasks. Use this whenever the user asks what they need to do, what's on their list, or anything similar.",
+    "input_schema": {
+        "type": "object",
+        "properties": {},
+        "required": []
     }
+}
 ]
 
 # Create the Anthropic client using our API key — this object is what
@@ -457,6 +466,20 @@ async def webhook(request: Request):
                 success = update_priority(chat_id, tool_input["task"], tool_input["priority"])
                 result_text = f"Priority updated to {tool_input['priority']}" if success else "Couldn't find that task"
 
+            elif tool_name == "list_tasks":
+                tasks = get_open_tasks(chat_id)
+
+                if not tasks:
+                    result_text = "No open tasks."
+                else:
+                    # Build a readable summary including due dates if present,
+                    # so Claude has real data to phrase a natural response from
+                    task_lines = []
+                    for t in tasks:
+                        task_id, task_text, due_date = t
+                        due_str = f" (due {due_date})" if due_date else ""
+                        task_lines.append(f"{task_text}{due_str}")
+                    result_text = "; ".join(task_lines)
             else:
                 result_text = "Unknown tool"
 
