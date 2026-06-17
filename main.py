@@ -37,7 +37,7 @@ def create_tables():
                 task TEXT NOT NULL,
                 status TEXT DEFAULT 'open',
                 due_date DATE,               -- NEW: optional due date, can be NULL
-                priority TEXT DEFAULT 'normal'
+                priority TEXT DEFAULT 'normal',
                 created_at TIMESTAMP DEFAULT NOW()
             )
         """))
