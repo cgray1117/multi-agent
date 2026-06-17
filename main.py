@@ -335,6 +335,61 @@ TELEGRAM_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
 # --- CLAUDE SETUP ---
 
+# Defining tools for Claude to use
+tools = [
+    {
+        "name": "create_task",
+        "description": "Adds a new task to the user's to-do list. Use this whenever the user mentions something they need to do, even if not phrased as a direct command.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": "The task description"
+                },
+                "due_date": {
+                    "type": "string",
+                    "description": "Due date in YYYY-MM-DD format, if mentioned. Omit if no due date given."
+                }
+            },
+            "required": ["task"]
+        }
+    },
+    {
+        "name": "complete_task",
+        "description": "Marks an existing task as done. Use this when the user indicates they finished or completed something.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": "Text describing which task to mark complete — doesn't need to be exact, partial match is fine"
+                }
+            },
+            "required": ["task"]
+        }
+    },
+    {
+        "name": "update_priority",
+        "description": "Changes the priority level of an existing task. Use this when the user indicates something is more or less important/urgent.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": "Text describing which task to update"
+                },
+                "priority": {
+                    "type": "string",
+                    "enum": ["low", "normal", "high"],
+                    "description": "The new priority level"
+                }
+            },
+            "required": ["task", "priority"]
+        }
+    }
+]
+
 # Create the Anthropic client using our API key — this object is what
 # we call .messages.create() on whenever we want a response from Claude
 claude_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
@@ -351,99 +406,83 @@ def health_check():
 @app.post("/webhook")
 async def webhook(request: Request):
     """
-    Main entry point — Telegram sends every incoming message here
-    as a POST request. This function decides what to do with it:
-    add a task, list tasks, or fall through to Claude for a normal reply.
+    Main entry point. Every message goes to Claude along with the
+    available tools. Claude decides whether to call a function
+    (create_task, complete_task, update_priority) or just respond
+    conversationally.
     """
-    # Parse the incoming JSON body from Telegram
     data = await request.json()
-
-    # Telegram nests everything inside a "message" object.
-    # We use .get() with defaults so this doesn't crash if the
-    # update is something other than a normal text message
-    # (e.g. a sticker, a join event, etc.)
     message = data.get("message", {})
     chat_id = str(message.get("chat", {}).get("id"))
     user_text = message.get("text", "")
 
-    # If there's no text or no chat_id, there's nothing useful to do —
-    # acknowledge receipt and exit early.
     if not user_text or not chat_id:
         return {"ok": True}
-    
-    # --- COMMAND: "done ___" ---
-    if user_text.lower().startswith("done"):
-        task_text = user_text[4:].strip()
-        
-        if not task_text:
-            send_telegram_message(chat_id, "Which task? Try: done call the venue")
-            return {"ok": True}
-        
-        was_updated = complete_task(chat_id, task_text)
-        
-        if was_updated:
-            send_telegram_message(chat_id, f"✅ Marked done: {task_text}")
-        else:
-            send_telegram_message(chat_id, f"Couldn't find an open task matching '{task_text}'")
-        
-        return {"ok": True}
 
-    # --- COMMAND: "add task ___" ---
-    if user_text.lower().startswith("add task"):
-        # Strip off the literal "add task" prefix (8 characters),
-        # then remove any leading colon and extra whitespace so
-        # both "add task: clean car" and "add task clean car" work
-        task_text = user_text[8:].lstrip(":").strip()
-
-        if task_text:
-            add_task(chat_id, task_text)
-            send_telegram_message(chat_id, f"Added task: {task_text}")
-        else:
-            # User typed "add task" with nothing after it
-            send_telegram_message(chat_id, "What's the task? Try: add task call the venue")
-
-        # Stop here — this command doesn't need to go to Claude at all
-        return {"ok": True}
-
-    # --- COMMAND: "my tasks" ---
-    if user_text.lower().strip() == "my tasks":
-        tasks = get_open_tasks(chat_id)
-
-        if not tasks:
-            send_telegram_message(chat_id, "You have no open tasks. 🎉")
-        else:
-            # Build a numbered list like "1. task one\n2. task two"
-            # t[1] is the task text column (t[0] would be the id)
-            task_list = "\n".join([f"{i+1}. {t[1]}" for i, t in enumerate(tasks)])
-            send_telegram_message(chat_id, f"Your open tasks:\n{task_list}")
-
-        return {"ok": True}
-
-    # --- DEFAULT: send to Claude for a normal conversational reply ---
-
-    # Save the user's message first so it's included in their own history
     save_message(chat_id, "user", user_text)
-
-    # Pull the last 10 messages (including the one we just saved)
-    # to give Claude conversational context
     history = get_conversation_history(chat_id)
 
-    # Call Claude with the system prompt (defines its role/personality)
-    # and the full conversation history
+    # First call to Claude — pass the tools so it can choose to use them
     response = claude_client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=1024,
-        system="You are a personal executive assistant. Be concise and practical.",
-        messages=history
+        system="You are a personal executive assistant. Use the available tools when the user wants to manage tasks. Otherwise just respond conversationally.",
+        messages=history,
+        tools=tools
     )
 
-    # Claude's reply text lives inside the first content block
-    reply = response.content[0].text
+    # Claude's response can contain text, a tool call, or both.
+    # We need to check what type of content block(s) came back.
+    tool_results = []
+    final_reply_text = ""
 
-    # Save Claude's reply too, so future messages have it as context
-    save_message(chat_id, "assistant", reply)
+    for block in response.content:
+        if block.type == "text":
+            final_reply_text += block.text
 
-    # Send the reply back to the user in Telegram
-    send_telegram_message(chat_id, reply)
+        elif block.type == "tool_use":
+            tool_name = block.name
+            tool_input = block.input
+
+            # Run the actual Python function that matches what Claude requested
+            if tool_name == "create_task":
+                add_task(chat_id, tool_input["task"], tool_input.get("due_date"))
+                result_text = f"Task added: {tool_input['task']}"
+
+            elif tool_name == "complete_task":
+                success = complete_task(chat_id, tool_input["task"])
+                result_text = "Marked as done" if success else "Couldn't find that task"
+
+            elif tool_name == "update_priority":
+                success = update_priority(chat_id, tool_input["task"], tool_input["priority"])
+                result_text = f"Priority updated to {tool_input['priority']}" if success else "Couldn't find that task"
+
+            else:
+                result_text = "Unknown tool"
+
+            # Claude needs to know what happened so it can respond naturally
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": block.id,
+                "content": result_text
+            })
+
+    # If Claude called a tool, we need a SECOND call — sending back
+    # the tool result so Claude can phrase a natural reply about it
+    if tool_results:
+        follow_up = claude_client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1024,
+            system="You are a personal executive assistant. Use the available tools when the user wants to manage tasks. Otherwise just respond conversationally.",
+            messages=history + [
+                {"role": "assistant", "content": response.content},
+                {"role": "user", "content": tool_results}
+            ],
+            tools=tools
+        )
+        final_reply_text = follow_up.content[0].text
+
+    save_message(chat_id, "assistant", final_reply_text)
+    send_telegram_message(chat_id, final_reply_text)
 
     return {"ok": True}
