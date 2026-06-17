@@ -12,18 +12,7 @@ import pytz
 
 from sqlalchemy import create_engine, text
 
-# --- DATABASE SETUP ---
-
-# Pull the database connection string from environment variables
-# (set in .env locally, and in Railway's Variables tab in production)
-DATABASE_URL = os.getenv("DATABASE_URL")
-
-# Create a SQLAlchemy "engine" — this manages the pool of connections
-# to Postgres. We reuse this single engine everywhere instead of
-# opening a new connection for every query.
-engine = create_engine(DATABASE_URL)
-
-
+# -------------- HELPER FUNCTIONS ----------------
 def create_tables():
     """
     Creates the database tables if they don't already exist.
@@ -53,36 +42,6 @@ def create_tables():
         """))
 
         conn.commit()
-
-
-# Run table creation once when the app starts up.
-# This means every fresh deploy/restart guarantees the tables exist.
-create_tables()
-
-# Set up basic logging so we can print useful debug info to Railway's logs
-logger = logging.getLogger(__name__)
-
-# load_dotenv() is commented out because Railway injects env vars directly —
-# this is only needed when running locally to read from a .env file
-# load_dotenv()
-
-# Create the FastAPI app instance — this is the core of our web server
-app = FastAPI()
-
-# --- SCHEDULER SETUP ---
-
-# BackgroundScheduler runs jobs in a separate thread so they don't
-# block your FastAPI app from handling normal webhook requests
-scheduler = BackgroundScheduler()
-
-# Define your timezone once — Railway's server runs on UTC by default,
-# so this tells APScheduler to convert "8am" into whatever UTC time
-# actually corresponds to 8am Eastern, including automatic handling
-# of daylight saving time shifts (EDT vs EST)
-eastern = pytz.timezone("America/New_York")
-
-
-import json
 
 def send_daily_briefing():
     """
@@ -131,30 +90,102 @@ def send_daily_briefing():
     # Send the AI-generated briefing back to Telegram
     send_telegram_message(chat_id, f"🌅 Good morning! Here's your focus for today:\n\n{briefing_text}")
 
-# Schedule the job to run every day at 8:00 AM
-scheduler.add_job(
-    send_daily_briefing,
-    CronTrigger(hour=8, minute=0, timezone=eastern),
-    id="daily_briefing"
-)
+def complete_task(chat_id, task_text):
+    """
+    Marks a task as 'done' by matching on its text (case-insensitive,
+    partial match) within this chat's open tasks. Returns True if
+    something was updated, False if no match was found.
+    """
+    with engine.connect() as conn:
+        result = conn.execute(text("""
+            UPDATE tasks
+            SET status = 'done'
+            WHERE chat_id = :chat_id 
+              AND status = 'open'
+              AND task ILIKE :task_pattern
+        """), {"chat_id": chat_id, "task_pattern": f"%{task_text}%"})
+        conn.commit()
+        return result.rowcount > 0
+    
+def get_completed_this_week(chat_id):
+    """
+    Returns tasks marked done in the last 7 days.
+    """
+    with engine.connect() as conn:
+        result = conn.execute(text("""
+            SELECT task FROM tasks
+            WHERE chat_id = :chat_id 
+              AND status = 'done'
+              AND created_at >= NOW() - INTERVAL '7 days'
+        """), {"chat_id": chat_id})
+        return [row[0] for row in result.fetchall()]
 
-# Start the scheduler when the app boots up
-scheduler.start()
+def get_neglected_tasks(chat_id):
+    """
+    Returns tasks that are still open and were created more than
+    7 days ago — these are the ones that have been sitting untouched.
+    """
+    with engine.connect() as conn:
+        result = conn.execute(text("""
+            SELECT task, created_at FROM tasks
+            WHERE chat_id = :chat_id 
+              AND status = 'open'
+              AND created_at <= NOW() - INTERVAL '7 days'
+            ORDER BY created_at ASC
+        """), {"chat_id": chat_id})
+        return result.fetchall()
+    
+def send_weekly_review():
+    """
+    Runs every Sunday. Summarizes what got done this week, flags
+    tasks that have been sitting open too long, and asks Claude
+    to generate priorities for the upcoming week.
+    """
+    chat_id = os.getenv("MY_CHAT_ID")
 
-# --- TELEGRAM SETUP ---
+    completed = get_completed_this_week(chat_id)
+    neglected = get_neglected_tasks(chat_id)
+    still_open = get_open_tasks(chat_id)  # includes due_date now
 
-# Grab the bot token from environment variables
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+    # Build readable text blocks for each category to hand to Claude
+    completed_text = "\n".join([f"- {t}" for t in completed]) or "Nothing marked done this week."
+    
+    neglected_text = "\n".join([f"- {t[0]} (added {t[1].strftime('%b %d')})" for t in neglected]) or "Nothing neglected — nice."
 
-# Build the base URL for all Telegram API calls using that token
-TELEGRAM_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+    open_lines = []
+    for t in still_open:
+        task_id, task_text, due_date = t
+        due_str = f" (due {due_date})" if due_date else ""
+        open_lines.append(f"- {task_text}{due_str}")
+    open_text = "\n".join(open_lines) or "No open tasks."
 
-# --- CLAUDE SETUP ---
+    prompt = f"""Here's my week:
 
-# Create the Anthropic client using our API key — this object is what
-# we call .messages.create() on whenever we want a response from Claude
-claude_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+                COMPLETED THIS WEEK:
+                {completed_text}
 
+                NEGLECTED (open more than 7 days):
+                {neglected_text}
+
+                CURRENTLY OPEN:
+                {open_text}
+
+                Give me a short weekly review:
+                1. A one-line acknowledgment of what got done
+                2. Call out anything neglected that I should either commit to or drop
+                3. Suggest my top 3 priorities for next week
+
+                Keep it concise and direct, this is a Sunday review not an essay."""
+
+    response = claude_client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=600,
+        system="You are a personal executive assistant doing a weekly review. Be honest and concise, not falsely encouraging.",
+        messages=[{"role": "user", "content": prompt}]
+    )
+
+    review_text = response.content[0].text
+    send_telegram_message(chat_id, f"📋 Weekly Review\n\n{review_text}")
 
 def send_telegram_message(chat_id: str, text: str):
     """
@@ -165,17 +196,6 @@ def send_telegram_message(chat_id: str, text: str):
         "chat_id": chat_id,
         "text": text
     })
-
-
-@app.get("/")
-def health_check():
-    """
-    Simple endpoint to confirm the app is alive.
-    Visiting the base URL in a browser hits this — useful for quick
-    sanity checks without needing Telegram involved at all.
-    """
-    return {"status": "alive"}
-
 
 def get_conversation_history(chat_id):
     """
@@ -199,7 +219,6 @@ def get_conversation_history(chat_id):
         # Claude's API expects: {"role": ..., "content": ...}
         return [{"role": row[0], "content": row[1]} for row in reversed(messages)]
 
-
 def save_message(chat_id, role, content):
     """
     Saves a single message (either from the user or from Claude)
@@ -211,7 +230,6 @@ def save_message(chat_id, role, content):
             VALUES (:chat_id, :role, :content)
         """), {"chat_id": chat_id, "role": role, "content": content})
         conn.commit()
-
 
 def add_task(chat_id, task_text, due_date=None):
     """
@@ -225,7 +243,6 @@ def add_task(chat_id, task_text, due_date=None):
         """), {"chat_id": chat_id, "task": task_text, "due_date": due_date})
         conn.commit()
 
-
 def get_open_tasks(chat_id):
     """
     Fetches all open tasks for this chat, including due dates,
@@ -238,7 +255,82 @@ def get_open_tasks(chat_id):
             ORDER BY created_at ASC
         """), {"chat_id": chat_id})
         return result.fetchall()
+    
+# --- DATABASE SETUP ---
 
+# Pull the database connection string from environment variables
+# (set in .env locally, and in Railway's Variables tab in production)
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+# Create a SQLAlchemy "engine" — this manages the pool of connections
+# to Postgres. We reuse this single engine everywhere instead of
+# opening a new connection for every query.
+engine = create_engine(DATABASE_URL)
+
+# Run table creation once when the app starts up.
+# This means every fresh deploy/restart guarantees the tables exist.
+create_tables()
+
+# Set up basic logging so we can print useful debug info to Railway's logs
+logger = logging.getLogger(__name__)
+
+# load_dotenv() is commented out because Railway injects env vars directly —
+# this is only needed when running locally to read from a .env file
+# load_dotenv()
+
+# Create the FastAPI app instance — this is the core of our web server
+app = FastAPI()
+
+# --- SCHEDULER SETUP ---
+
+# BackgroundScheduler runs jobs in a separate thread so they don't
+# block your FastAPI app from handling normal webhook requests
+scheduler = BackgroundScheduler()
+
+# Define your timezone once — Railway's server runs on UTC by default,
+# so this tells APScheduler to convert "8am" into whatever UTC time
+# actually corresponds to 8am Eastern, including automatic handling
+# of daylight saving time shifts (EDT vs EST)
+eastern = pytz.timezone("America/New_York")
+
+# Schedule the job to run every day at 8:00 AM
+scheduler.add_job(
+    send_daily_briefing,
+    CronTrigger(hour=8, minute=0, timezone=eastern),
+    id="daily_briefing"
+)
+
+scheduler.add_job(
+    send_weekly_review,
+    CronTrigger(day_of_week="sun", hour=18, minute=0, timezone=eastern),  # Sunday 6pm Eastern
+    id="weekly_review"
+)
+
+# Start the scheduler when the app boots up
+scheduler.start()
+
+# --- TELEGRAM SETUP ---
+
+# Grab the bot token from environment variables
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+
+# Build the base URL for all Telegram API calls using that token
+TELEGRAM_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+
+# --- CLAUDE SETUP ---
+
+# Create the Anthropic client using our API key — this object is what
+# we call .messages.create() on whenever we want a response from Claude
+claude_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+
+@app.get("/")
+def health_check():
+    """
+    Simple endpoint to confirm the app is alive.
+    Visiting the base URL in a browser hits this — useful for quick
+    sanity checks without needing Telegram involved at all.
+    """
+    return {"status": "alive"}
 
 @app.post("/webhook")
 async def webhook(request: Request):
@@ -261,6 +353,23 @@ async def webhook(request: Request):
     # If there's no text or no chat_id, there's nothing useful to do —
     # acknowledge receipt and exit early.
     if not user_text or not chat_id:
+        return {"ok": True}
+    
+    # --- COMMAND: "done ___" ---
+    if user_text.lower().startswith("done"):
+        task_text = user_text[4:].strip()
+        
+        if not task_text:
+            send_telegram_message(chat_id, "Which task? Try: done call the venue")
+            return {"ok": True}
+        
+        was_updated = complete_task(chat_id, task_text)
+        
+        if was_updated:
+            send_telegram_message(chat_id, f"✅ Marked done: {task_text}")
+        else:
+            send_telegram_message(chat_id, f"Couldn't find an open task matching '{task_text}'")
+        
         return {"ok": True}
 
     # --- COMMAND: "add task ___" ---
