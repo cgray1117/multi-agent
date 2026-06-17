@@ -7,17 +7,12 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-load_dotenv()
+#load_dotenv()
 
 app = FastAPI()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
-
-@app.on_event("startup")
-async def startup_event():
-    logger.info(f"TELEGRAM_TOKEN present: {bool(TELEGRAM_TOKEN)}")
-    logger.info(f"ANTHROPIC_KEY present: {bool(os.getenv('ANTHROPIC_API_KEY'))}")
 
 claude_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
