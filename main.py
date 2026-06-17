@@ -7,6 +7,7 @@ import logging
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+import pytz
 
 from sqlalchemy import create_engine, text
 
@@ -76,6 +77,12 @@ app = FastAPI()
 # block your FastAPI app from handling normal webhook requests
 scheduler = BackgroundScheduler()
 
+# Define your timezone once — Railway's server runs on UTC by default,
+# so this tells APScheduler to convert "8am" into whatever UTC time
+# actually corresponds to 8am Eastern, including automatic handling
+# of daylight saving time shifts (EDT vs EST)
+eastern = pytz.timezone("America/New_York")
+
 
 def send_daily_briefing():
     """
@@ -92,7 +99,7 @@ def send_daily_briefing():
 # Schedule the job to run every day at 8:00 AM
 scheduler.add_job(
     send_daily_briefing,
-    CronTrigger(hour=16, minute=59),
+    CronTrigger(hour=8, minute=0, timezone=eastern),
     id="daily_briefing"
 )
 
