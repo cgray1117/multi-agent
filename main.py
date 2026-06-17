@@ -5,6 +5,9 @@ import requests
 import anthropic
 import logging
 
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+
 from sqlalchemy import create_engine, text
 
 # --- DATABASE SETUP ---
@@ -66,6 +69,35 @@ logger = logging.getLogger(__name__)
 
 # Create the FastAPI app instance — this is the core of our web server
 app = FastAPI()
+
+# --- SCHEDULER SETUP ---
+
+# BackgroundScheduler runs jobs in a separate thread so they don't
+# block your FastAPI app from handling normal webhook requests
+scheduler = BackgroundScheduler()
+
+
+def send_daily_briefing():
+    """
+    Placeholder function that will eventually pull your tasks,
+    rank them, and send you a morning briefing. For now it just
+    sends a test message so we can confirm scheduling works.
+    """
+    # NOTE: you'll need a real chat_id here — your own Telegram chat ID,
+    # since this runs automatically with no incoming message to read it from
+    YOUR_CHAT_ID = os.getenv("MY_CHAT_ID")
+    send_telegram_message(YOUR_CHAT_ID, "🌅 Good morning! This is your scheduled briefing test.")
+
+
+# Schedule the job to run every day at 8:00 AM
+scheduler.add_job(
+    send_daily_briefing,
+    CronTrigger(hour=9, minute=50),
+    id="daily_briefing"
+)
+
+# Start the scheduler when the app boots up
+scheduler.start()
 
 # --- TELEGRAM SETUP ---
 
