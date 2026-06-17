@@ -1,6 +1,7 @@
 from fastapi import FastAPI, Request
 from dotenv import load_dotenv
 import os
+import json
 import requests
 import anthropic
 import logging
@@ -30,30 +31,27 @@ def create_tables():
     it won't wipe or duplicate tables on restart/redeploy.
     """
     with engine.connect() as conn:
-        # Table for storing every message (both user and Claude's replies)
-        # so we can rebuild conversation history/context later.
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS messages (
                 id SERIAL PRIMARY KEY,
-                chat_id TEXT NOT NULL,       -- which Telegram chat this belongs to
-                role TEXT NOT NULL,          -- 'user' or 'assistant'
-                content TEXT NOT NULL,       -- the actual message text
-                created_at TIMESTAMP DEFAULT NOW()  -- when it was sent
+                chat_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW()
             )
         """))
 
-        # Table for storing to-do tasks per chat/user
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS tasks (
                 id SERIAL PRIMARY KEY,
                 chat_id TEXT NOT NULL,
                 task TEXT NOT NULL,
-                status TEXT DEFAULT 'open',  -- 'open' or 'done' (future use)
+                status TEXT DEFAULT 'open',
+                due_date DATE,               -- NEW: optional due date, can be NULL
                 created_at TIMESTAMP DEFAULT NOW()
             )
         """))
 
-        # Commit so the table creation actually saves to the database
         conn.commit()
 
 
@@ -84,17 +82,54 @@ scheduler = BackgroundScheduler()
 eastern = pytz.timezone("America/New_York")
 
 
+import json
+
 def send_daily_briefing():
     """
-    Placeholder function that will eventually pull your tasks,
-    rank them, and send you a morning briefing. For now it just
-    sends a test message so we can confirm scheduling works.
+    Pulls all open tasks for the user, sends them to Claude to be
+    ranked by urgency and estimated energy cost, then sends the
+    top priorities back as a morning briefing via Telegram.
     """
-    # NOTE: you'll need a real chat_id here — your own Telegram chat ID,
-    # since this runs automatically with no incoming message to read it from
-    YOUR_CHAT_ID = os.getenv("MY_CHAT_ID")
-    send_telegram_message(YOUR_CHAT_ID, "🌅 Good morning! This is your scheduled briefing test.")
+    chat_id = os.getenv("MY_CHAT_ID")
+    tasks = get_open_tasks(chat_id)
 
+    # If there's nothing to rank, just say so and stop early
+    if not tasks:
+        send_telegram_message(chat_id, "🌅 Good morning! You have no open tasks today.")
+        return
+
+    # Build a plain-text list of tasks (with due dates if present)
+    # to hand to Claude as context
+    task_lines = []
+    for t in tasks:
+        _, task_text, due_date = t
+        due_str = f" (due {due_date})" if due_date else ""
+        task_lines.append(f"- {task_text}{due_str}")
+    task_list_text = "\n".join(task_lines)
+
+    # Ask Claude to rank them. We're explicit about the output format
+    # so we can reliably parse it back out afterward.
+    prompt = f"""Here are my open tasks:
+
+                {task_list_text}
+
+                Rank these by urgency (factoring in due dates if present) and 
+                estimated energy cost (how much focus/effort each likely takes).
+                Return the top 3 I should focus on today, with a one-sentence 
+                reason for each. Keep it concise — this is a morning briefing,
+                not a report."""
+
+    response = claude_client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=500,
+        system="You are a personal executive assistant helping prioritize a busy day. Be direct and practical.",
+        messages=[{"role": "user", "content": prompt}]
+    )
+
+    briefing_text = response.content[0].text
+
+    # Send the AI-generated briefing back to Telegram
+    send_telegram_message(chat_id, f"🌅 Good morning! Here's your focus for today:\n\n{briefing_text}")
 
 # Schedule the job to run every day at 8:00 AM
 scheduler.add_job(
@@ -178,27 +213,27 @@ def save_message(chat_id, role, content):
         conn.commit()
 
 
-def add_task(chat_id, task_text):
+def add_task(chat_id, task_text, due_date=None):
     """
     Inserts a new task into the tasks table with status 'open'.
+    due_date is optional — pass None if no due date is given.
     """
     with engine.connect() as conn:
         conn.execute(text("""
-            INSERT INTO tasks (chat_id, task, status)
-            VALUES (:chat_id, :task, 'open')
-        """), {"chat_id": chat_id, "task": task_text})
+            INSERT INTO tasks (chat_id, task, status, due_date)
+            VALUES (:chat_id, :task, 'open', :due_date)
+        """), {"chat_id": chat_id, "task": task_text, "due_date": due_date})
         conn.commit()
 
 
 def get_open_tasks(chat_id):
     """
-    Fetches all tasks for this chat that haven't been marked done yet,
-    ordered from oldest to newest so the list reads in the order
-    tasks were added.
+    Fetches all open tasks for this chat, including due dates,
+    ordered from oldest to newest.
     """
     with engine.connect() as conn:
         result = conn.execute(text("""
-            SELECT id, task FROM tasks
+            SELECT id, task, due_date FROM tasks
             WHERE chat_id = :chat_id AND status = 'open'
             ORDER BY created_at ASC
         """), {"chat_id": chat_id})
