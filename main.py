@@ -92,7 +92,7 @@ def send_daily_briefing():
 # Schedule the job to run every day at 8:00 AM
 scheduler.add_job(
     send_daily_briefing,
-    CronTrigger(hour=16, minute=53),
+    CronTrigger(hour=16, minute=59),
     id="daily_briefing"
 )
 
