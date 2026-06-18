@@ -17,7 +17,8 @@ from database import engine, create_tables
 from telegram import send_telegram_message
 from tools import all_tools, dispatch_tool_call
 from agents.chief_of_staff import send_daily_briefing, send_weekly_review
-from agents.wellness import seed_habits, send_evening_checkin
+from agents.wellness import seed_habits, seed_exercises, send_evening_checkin
+
 
 # --- APP + DB SETUP ---
 
@@ -27,6 +28,8 @@ create_tables()  # safe to run every startup — IF NOT EXISTS guards it
 # Seed your wellness habits once — seed_habits() checks for existing
 # entries before inserting, so this is safe to call on every startup
 seed_habits(os.getenv("MY_CHAT_ID"))
+seed_exercises()  # no chat_id needed — exercises are global, not per-user
+
 
 claude_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 

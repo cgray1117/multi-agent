@@ -115,4 +115,27 @@ def create_tables():
             )
         """))
 
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS exercises (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                primary_muscles_worked TEXT,
+                secondary_muscles_worked TEXT,
+                note TEXT                      -- optional context, e.g. "skipped, low energy"
+            )
+        """))
+
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS workouts (
+                id SERIAL PRIMARY KEY,
+                exercise_id INTEGER REFERENCES exercises(id),
+                chat_id TEXT NOT NULL,
+                workout_duration_minutes INTEGER,
+                reps_per_set INTEGER,
+                sets INTEGER,
+                logged_at TIMESTAMP DEFAULT NOW(),
+                note TEXT                      -- optional context, e.g. "skipped, low energy"
+            )
+        """))
+
         conn.commit()

@@ -17,6 +17,177 @@ import anthropic
 
 claude_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
+# --- WORKOUT LOGGER ---
+
+# Your calisthenics exercise library — seeded once into the exercises
+# table. These are the definitions; workouts table stores the actual
+# logged sessions that reference these by id.
+CALISTHENICS_EXERCISES = [
+    ("pushups", "chest, triceps, anterior deltoid", "core"),
+    ("pull-ups", "latissimus dorsi, biceps", "rear deltoid, core"),
+    ("inverted rows", "latissimus dorsi, biceps, rear deltoid", "core, forearms"),
+    ("dips", "triceps, chest", "anterior deltoid"),
+    ("squats", "quadriceps, glutes", "hamstrings, core"),
+    ("lunges", "quadriceps, glutes", "hamstrings, calves"),
+    ("plank", "core, transverse abdominis", "shoulders, glutes"),
+    ("burpees", "full body, cardio", "core, shoulders"),
+    ("mountain climbers", "core, cardio", "shoulders, hip flexors"),
+    ("jump squats", "quadriceps, glutes, cardio", "calves, core"),
+    ("pike pushups", "shoulders, triceps", "core"),
+    ("glute bridges", "glutes, hamstrings", "core, lower back"),
+    ("calf raises", "calves", "ankles"),
+]
+
+
+def seed_exercises():
+    """
+    Inserts CALISTHENICS_EXERCISES into the exercises table, skipping
+    any that already exist by name. Safe to call on every startup.
+    """
+    with engine.connect() as conn:
+        for name, primary, secondary in CALISTHENICS_EXERCISES:
+            existing = conn.execute(text("""
+                SELECT id FROM exercises WHERE name = :name
+            """), {"name": name}).fetchone()
+
+            if not existing:
+                conn.execute(text("""
+                    INSERT INTO exercises (name, primary_muscles_worked, secondary_muscles_worked)
+                    VALUES (:name, :primary, :secondary)
+                """), {"name": name, "primary": primary, "secondary": secondary})
+        conn.commit()
+
+
+def get_or_create_exercise(name_fragment):
+    """
+    Finds an exercise by partial, case-insensitive name match.
+    If no match is found, creates a new exercise entry with just
+    the name so novel exercises (e.g. a new movement you try) can
+    still be logged without crashing.
+    Returns the exercise id and canonical name.
+    """
+    with engine.connect() as conn:
+        # Try to find existing match first
+        result = conn.execute(text("""
+            SELECT id, name FROM exercises
+            WHERE name ILIKE :pattern
+            LIMIT 1
+        """), {"pattern": f"%{name_fragment}%"}).fetchone()
+
+        if result:
+            return result[0], result[1]
+
+        # Create a new exercise entry if nothing matched
+        new_exercise = conn.execute(text("""
+            INSERT INTO exercises (name)
+            VALUES (:name)
+            RETURNING id, name
+        """), {"name": name_fragment}).fetchone()
+        conn.commit()
+        return new_exercise[0], new_exercise[1]
+
+
+def log_workout(chat_id, exercise_name, sets=None, reps_per_set=None,
+                duration_minutes=None, note=None):
+    """
+    Logs a workout session. Finds or creates the exercise first,
+    then writes a row to workouts with whatever detail was provided.
+    All fields except exercise_name are optional — you might log
+    "did a 20 min walk" (duration only) or "3 sets of 10 pushups"
+    (sets + reps, no duration).
+    Returns the canonical exercise name so Claude can confirm it.
+    """
+    exercise_id, canonical_name = get_or_create_exercise(exercise_name)
+
+    with engine.connect() as conn:
+        conn.execute(text("""
+            INSERT INTO workouts
+                (chat_id, exercise_id, sets, reps_per_set, workout_duration_minutes, note)
+            VALUES
+                (:chat_id, :exercise_id, :sets, :reps_per_set, :duration, :note)
+        """), {
+            "chat_id": chat_id,
+            "exercise_id": exercise_id,
+            "sets": sets,
+            "reps_per_set": reps_per_set,
+            "duration": duration_minutes,
+            "note": note
+        })
+        conn.commit()
+
+    return canonical_name
+
+
+def get_workout_history(chat_id, days=30):
+    """
+    Returns all workout logs for the last `days` days, joined with
+    exercise names so the output is human-readable. Claude uses this
+    to summarize workout patterns and frequency.
+    """
+    with engine.connect() as conn:
+        result = conn.execute(text("""
+            SELECT
+                e.name,
+                w.sets,
+                w.reps_per_set,
+                w.workout_duration_minutes,
+                w.note,
+                w.logged_at
+            FROM workouts w
+            JOIN exercises e ON e.id = w.exercise_id
+            WHERE w.chat_id = :chat_id
+              AND w.logged_at >= NOW() - INTERVAL :days_interval
+            ORDER BY w.logged_at DESC
+        """), {"chat_id": chat_id, "days_interval": f"{days} days"})
+        return result.fetchall()
+
+
+def get_workout_summary(chat_id):
+    """
+    Pulls the last 30 days of workout history and asks Claude to
+    summarize frequency, variety, and any patterns worth noting.
+    This is the 'how's my training looking' on-demand command.
+    """
+    history = get_workout_history(chat_id, days=30)
+
+    if not history:
+        return "No workouts logged in the last 30 days."
+
+    lines = []
+    for name, sets, reps, duration, note, logged_at in history:
+        date_str = logged_at.strftime("%b %d")
+        detail_parts = []
+        if sets and reps:
+            detail_parts.append(f"{sets} sets x {reps} reps")
+        if duration:
+            detail_parts.append(f"{duration} min")
+        if note:
+            detail_parts.append(f"({note})")
+        detail = ", ".join(detail_parts) or "logged"
+        lines.append(f"- {date_str}: {name} — {detail}")
+
+    history_text = "\n".join(lines)
+
+    prompt = f"""Here are my workouts from the last 30 days:
+
+{history_text}
+
+Give me a brief summary:
+1. How many sessions total, and which exercises came up most
+2. Am I hitting calisthenics 3x/week on average
+3. Anything I should do more or less of
+
+Keep it short and direct."""
+
+    response = claude_client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=400,
+        system="You are a fitness-aware assistant. Be factual about the data, not falsely encouraging.",
+        messages=[{"role": "user", "content": prompt}]
+    )
+
+    return response.content[0].text
+
 
 # --- HABIT DEFINITIONS (one-time setup) ---
 
@@ -179,8 +350,8 @@ def send_evening_checkin():
     send_telegram_message(
         chat_id,
         "🌙 Evening check-in: Did you get your walk in today? "
-        "How about journaling? Anything else physical/mental health-wise "
-        "you want to log — just tell me directly."
+        "How about journaling? How are you feeling mentally after the day?"
+        "If you're able, get started on your night routine and start winding down."
     )
 
 
@@ -209,6 +380,41 @@ wellness_tools = [
         "name": "get_wellness_snapshot",
         "description": "Analyzes the user's physical and mental health habit adherence over the last 30 days and summarizes what's on track vs. slipping. Use this when the user asks how they're doing physically/mentally, how they're trending, or similar.",
         "input_schema": {"type": "object", "properties": {}, "required": []}
+    },
+    {
+        "name": "log_workout",
+        "description": "Logs a workout session with exercise name and optional sets, reps, and duration. Use this whenever the user mentions doing any physical exercise — calisthenics, a walk, a run, stretching, anything.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "exercise": {
+                    "type": "string",
+                    "description": "The exercise name in the user's own words — e.g. 'pushups', 'pull-ups', 'walk', 'squats'"
+                },
+                "sets": {
+                    "type": "integer",
+                    "description": "Number of sets, if mentioned"
+                },
+                "reps_per_set": {
+                    "type": "integer",
+                    "description": "Reps per set, if mentioned"
+                },
+                "duration_minutes": {
+                    "type": "integer",
+                    "description": "Duration in minutes, if mentioned"
+                },
+                "note": {
+                    "type": "string",
+                    "description": "Any extra context the user mentioned, e.g. 'felt strong today' or 'modified, on knees'"
+                }
+            },
+            "required": ["exercise"]
+        }
+    },
+    {
+        "name": "get_workout_summary",
+        "description": "Pulls the last 30 days of workout history and summarizes frequency, variety, and patterns. Use this when the user asks how their training is going, how often they've been working out, or similar.",
+        "input_schema": {"type": "object", "properties": {}, "required": []}
     }
 ]
 
@@ -227,5 +433,18 @@ def handle_tool_call(tool_name, tool_input, chat_id):
 
     elif tool_name == "get_wellness_snapshot":
         return generate_wellness_snapshot(chat_id)
+    elif tool_name == "log_workout":
+        canonical_name = log_workout(
+            chat_id,
+            tool_input["exercise"],
+            sets=tool_input.get("sets"),
+            reps_per_set=tool_input.get("reps_per_set"),
+            duration_minutes=tool_input.get("duration_minutes"),
+            note=tool_input.get("note")
+        )
+        return f"Logged: {canonical_name}"
+
+    elif tool_name == "get_workout_summary":
+        return get_workout_summary(chat_id)
 
     return None  # not a Wellness tool
