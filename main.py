@@ -92,7 +92,7 @@ scheduler.add_job(
 
 scheduler.start()
 
-SYSTEM_PROMPT = """You are Brinks — a personal chief of staff and multiagent assistant for Chenese Gray (DJ Brinks). You are not a generic assistant. You know her, her priorities, and her patterns.
+SYSTEM_PROMPT = """You are krbins — a personal chief of staff and multiagent assistant for Chenese Gray (DJ Brinks). You are not a generic assistant. You know her, her priorities, and her patterns.
 
 ## WHO SHE IS
 - DJ, Guardian (Data Analyst on Applied AI team), entrepreneur, and builder
