@@ -17,7 +17,7 @@ from database import engine, create_tables
 from telegram import send_telegram_message
 from tools import all_tools, dispatch_tool_call
 from agents.chief_of_staff import send_daily_briefing, send_weekly_review
-from agents.wellness import seed_habits, seed_exercises, send_evening_checkin
+from agents.wellness import seed_habits, seed_exercises, send_evening_checkin, send_weekly_workout_summary
 
 
 # --- APP + DB SETUP ---
@@ -82,6 +82,12 @@ scheduler.add_job(
     send_evening_checkin,
     CronTrigger(hour=21, minute=0, timezone=eastern),  # 9pm Eastern
     id="evening_checkin"
+)
+
+scheduler.add_job(
+    send_weekly_workout_summary,
+    CronTrigger(day_of_week="mon", hour=8, minute=15, timezone=eastern),
+    id="weekly_workout_summary"
 )
 
 scheduler.start()

@@ -188,6 +188,60 @@ Keep it short and direct."""
 
     return response.content[0].text
 
+def send_weekly_workout_summary():
+    """
+    Scheduled job (Mondays 8am Eastern) — pulls last 7 days of
+    workouts and sends a count summary to Telegram. Fires after
+    the daily briefing so it feels like a natural Monday morning
+    addition rather than a separate interruption.
+    """
+    chat_id = os.getenv("MY_CHAT_ID")
+    history = get_workout_history(chat_id, days=7)
+
+    if not history:
+        send_telegram_message(
+            chat_id,
+            "💪 Weekly Workout Check — no workouts logged this past week."
+        )
+        return
+
+    # Count total sessions and build a readable breakdown by exercise
+    exercise_counts = {}
+    for name, sets, reps, duration, note, logged_at in history:
+        exercise_counts[name] = exercise_counts.get(name, 0) + 1
+
+    total = len(history)
+    breakdown = "\n".join([
+        f"  • {name}: {count}x"
+        for name, count in sorted(exercise_counts.items(),
+                                   key=lambda x: x[1], reverse=True)
+    ])
+
+    # Simple on-track check against your 3x/week calisthenics target
+    calisthenics_names = {
+        "pushups", "pull-ups", "dips", "squats", "lunges",
+        "plank", "burpees", "mountain climbers", "jump squats",
+        "pike pushups", "glute bridges", "calf raises", "inverted rows"
+    }
+    calisthenics_count = sum(
+        1 for name, *_ in history
+        if any(ex in name.lower() for ex in calisthenics_names)
+    )
+
+    target_status = (
+        "✅ Hit your 3x/week target"
+        if calisthenics_count >= 3
+        else f"⚠️ {calisthenics_count}/3 calisthenics sessions — below target"
+    )
+
+    message = (
+        f"💪 Weekly Workout Summary\n\n"
+        f"Total sessions: {total}\n"
+        f"{target_status}\n\n"
+        f"Breakdown:\n{breakdown}"
+    )
+
+    send_telegram_message(chat_id, message)
 
 # --- HABIT DEFINITIONS (one-time setup) ---
 
